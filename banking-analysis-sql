@@ -1,0 +1,170 @@
+-- ============================================================================
+-- SECTION 1: DATABASE SETUP & TABLE CREATION
+-- ============================================================================
+
+CREATE TABLE customers (
+    customer_id INT PRIMARY KEY,
+    first_name VARCHAR(50),
+    age INT,
+    city VARCHAR(50),
+    join_date DATE
+);
+
+CREATE TABLE accounts (
+    account_id INT PRIMARY KEY,
+    customer_id INT,
+    account_type VARCHAR(20),
+    balance DECIMAL(15,2),
+    opened_date DATE,
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+);
+
+CREATE TABLE loans (
+    loan_id INT PRIMARY KEY,
+    customer_id INT,
+    loan_amount DECIMAL(15,2),
+    interest_rate DECIMAL(5,2),
+    loan_status VARCHAR(20),
+    loan_start_date DATE,
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+);
+
+CREATE TABLE transactions (
+    transaction_id INT PRIMARY KEY,
+    account_id INT,
+    transaction_date DATE,
+    transaction_type VARCHAR(10),
+    amount DECIMAL(15,2),
+    FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+);
+
+-- ============================================================================
+-- SECTION 2: DATA QUALITY CHECKS (VALIDATION LAYER)
+-- ============================================================================
+-- Business Value: Establishing data reliability before performing financial analysis.
+
+-- Check 1: Record Completeness Profiling
+SELECT 'Customers' AS table_name, COUNT(*) FROM customers
+UNION ALL SELECT 'Accounts', COUNT(*) FROM accounts
+UNION ALL SELECT 'Loans', COUNT(*) FROM loans
+UNION ALL SELECT 'Transactions', COUNT(*) FROM transactions;
+
+-- Check 2: Identifying NULLs in Critical Financial Fields
+SELECT 
+    COUNT(*) - COUNT(balance) AS null_balances 
+FROM accounts;
+
+-- Check 3: Duplicate Record Detection
+-- Identifying duplicate primary keys or repeated entries that could skew balance aggregations.
+SELECT customer_id, COUNT(*) FROM customers GROUP BY customer_id HAVING COUNT(*) > 1
+UNION ALL
+SELECT account_id, COUNT(*) FROM accounts GROUP BY account_id HAVING COUNT(*) > 1
+UNION ALL
+SELECT loan_id, COUNT(*) FROM loans GROUP BY loan_id HAVING COUNT(*) > 1
+UNION ALL
+SELECT transaction_id, COUNT(*) FROM transactions GROUP BY transaction_id HAVING COUNT(*) > 1;
+
+-- Check 3: Logical Validation (Negative Balances or Future Dates)
+SELECT * FROM accounts WHERE balance < 0;
+SELECT * FROM transactions WHERE transaction_date > CURRENT_DATE;
+
+-- Check 4: Referential Integrity (Orphaned Accounts)
+SELECT a.account_id, a.customer_id
+FROM accounts a
+LEFT JOIN customers c ON a.customer_id = c.customer_id
+WHERE c.customer_id IS NULL;
+
+-- ============================================================================
+-- SECTION 3: THE QUERIES (ANALYSIS & WINDOW FUNCTIONS)
+-- ============================================================================
+
+-- Query 1: Top Customers by Asset Value (Advanced Ranking)
+-- Business Value: Uses Window Functions to rank customers by total balance across all accounts.
+-- Finding: Mary leads with a total asset value of $924,772.
+SELECT 
+    c.first_name,
+    SUM(a.balance) AS total_balance,
+    RANK() OVER(ORDER BY SUM(a.balance) DESC) AS asset_rank
+FROM customers c
+JOIN accounts a ON c.customer_id = a.customer_id
+GROUP BY c.customer_id, c.first_name
+LIMIT 20;
+
+-- Query 2: Loan Default Risk Analysis
+-- Business Value: Identifies customers currently in default to prioritize collection efforts.
+-- Finding: Richard ($316,918) and Andrew ($226,093) represent the highest default risk.
+SELECT 
+    c.first_name,
+    l.loan_amount,
+    l.loan_status,
+    ROUND(l.loan_amount / NULLIF((SELECT SUM(balance) FROM accounts WHERE customer_id = c.customer_id), 0), 2) AS debt_to_asset_ratio
+FROM customers c
+JOIN loans l ON c.customer_id = l.customer_id
+WHERE l.loan_status = 'Defaulted'
+ORDER BY l.loan_amount DESC;
+
+-- Query 3: High-Value Transaction Patterns (LAG/LEAD)
+-- Business Value: Identifies large outflows that could signal account closure or capital flight.
+WITH customer_daily_spend AS (
+    SELECT 
+        account_id, 
+        transaction_date, 
+        SUM(amount) AS daily_amount 
+    FROM transactions 
+    WHERE transaction_type = 'Debit' 
+    GROUP BY 1, 2
+)
+SELECT 
+    account_id, 
+    transaction_date, 
+    daily_amount,
+    LAG(daily_amount) OVER(PARTITION BY account_id ORDER BY transaction_date) AS prev_day_amount,
+    daily_amount - LAG(daily_amount) OVER(PARTITION BY account_id ORDER BY transaction_date) AS daily_volatility
+FROM customer_daily_spend
+WHERE daily_amount > 10000;
+
+-- Query 4: Statistical Outlier Detection (Fraud Monitoring)
+-- Business Value: Flags transactions that are mathematically unusual (3+ Standard Deviations).
+-- Finding: Identified 3,145 anomalous transactions requiring investigation.
+WITH stats AS (
+    SELECT AVG(amount) AS mean_amt, STDDEV(amount) AS std_amt FROM transactions
+)
+SELECT t.* FROM transactions t, stats s
+WHERE t.amount > (s.mean_amt + 3 * s.std_amt);
+
+-- ============================================================================
+-- SECTION 4: VIEWS & OPTIMIZATION
+-- ============================================================================
+
+-- Materialized View: Pre-aggregated Customer 360 View
+CREATE MATERIALIZED VIEW mv_customer_360 AS
+SELECT 
+    c.customer_id, 
+    c.first_name, 
+    SUM(a.balance) AS total_balance,
+    COUNT(l.loan_id) AS total_loans
+FROM customers c
+LEFT JOIN accounts a ON c.customer_id = a.customer_id
+LEFT JOIN loans l ON c.customer_id = l.customer_id
+GROUP BY 1, 2;
+
+-- ============================================================================
+-- SECTION 5: PERFORMANCE OPTIMIZATION (INDEXING)
+-- ============================================================================
+
+-- Index 1: Improving JOIN performance between Customers and Accounts
+-- Technical Reason: customer_id is a Foreign Key. Without this index, every 
+-- balance calculation would require a slow "Full Table Scan" of the accounts table.
+-- Business Value: Ensures that customer asset reports load instantly for bank managers.
+CREATE INDEX idx_accounts_customer ON accounts(customer_id);
+
+-- Index 2: Optimizing Transaction History Retrieval
+-- Technical Reason: account_id is the primary joining key for transaction analysis. 
+-- Indexing it allows the database to jump directly to an account's history.
+-- Business Value: Critical for real-time fraud detection and customer statement generation.
+CREATE INDEX idx_transactions_account ON transactions(account_id);
+
+-- Index 3: Time-Series Analysis Optimization
+-- Technical Reason: Most transaction queries filter by date ranges.
+-- Business Value: Speeds up monthly and quarterly financial reporting.
+CREATE INDEX idx_transactions_date ON transactions(transaction_date);
